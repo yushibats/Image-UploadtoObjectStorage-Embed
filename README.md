@@ -127,7 +127,7 @@ user=ocid1.user.oc1..aaaaaaaa...
 fingerprint=12:34:56:78:90:ab:cd:ef...
 key_file=~/.oci/oci_api_key.pem
 tenancy=ocid1.tenancy.oc1..aaaaaaaa...
-region=ap-tokyo-1
+region=ap-osaka-1
 ```
 
 #### OCI IAM ポリシー設定
@@ -170,13 +170,13 @@ docker-compose -f docker-compose.prod.yml up -d
 ## 🧪 テスト
 
 ### アップロードテスト
-ブラウザで `test_upload.html` を開いてアップロード機能をテストできます：
+ブラウザで `test.html` を開いてアップロード機能をテストできます：
 
 ```bash
 # 開発サーバー起動後
 open http://localhost:5000/test
 # または
-open http://localhost:5000/test_upload.html
+open http://localhost:5000/test.html
 ```
 
 ### API テスト
@@ -200,7 +200,7 @@ curl http://localhost:5000/img/my-bucket/test.jpg
 ├── wsgi.py                   # WSGI エントリーポイント
 ├── requirements.txt          # Python 依存関係
 ├── test_app.py              # テストスイート
-├── test_upload.html         # アップロードテスト用HTML
+├── test.html         # アップロードテスト用HTML
 ├── .env.example             # 環境変数設定例
 ├── Dockerfile               # Docker イメージ定義
 ├── docker-compose.yml       # Docker Compose 設定
