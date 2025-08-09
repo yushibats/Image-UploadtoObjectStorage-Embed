@@ -64,7 +64,6 @@ structlog.configure(
     wrapper_class=structlog.stdlib.BoundLogger,
     cache_logger_on_first_use=True,
 )
-
 logger = structlog.get_logger(__name__)
 
 
@@ -82,7 +81,6 @@ class OCIClient:
     def _initialize(self):
         """OCI クライアントの初期化"""
         try:
-            # OCI設定の読み込み
             config_file = os.path.expanduser(settings.OCI_CONFIG_FILE)
             if not os.path.exists(config_file):
                 logger.warning("OCI設定ファイルが見つかりません", config_file=config_file)
@@ -93,7 +91,6 @@ class OCIClient:
                 profile_name=settings.OCI_PROFILE
             )
 
-            # リージョンの設定（指定があれば上書き）
             if settings.OCI_REGION:
                 config['region'] = settings.OCI_REGION
 
@@ -110,14 +107,11 @@ class OCIClient:
             self.namespace = None
 
     def is_connected(self) -> bool:
-        """接続状態の確認"""
         return self.client is not None and self.namespace is not None
 
     def get_object(self, bucket_name: str, object_name: str):
-        """オブジェクトの取得"""
         if not self.is_connected():
             raise RuntimeError("OCI クライアントが初期化されていません")
-
         return self.client.get_object(
             namespace_name=self.namespace,
             bucket_name=bucket_name,
@@ -125,10 +119,8 @@ class OCIClient:
         )
 
     def put_object(self, bucket_name: str, object_name: str, data, content_type: str = None):
-        """オブジェクトのアップロード"""
         if not self.is_connected():
             raise RuntimeError("OCI クライアントが初期化されていません")
-
         return self.client.put_object(
             namespace_name=self.namespace,
             bucket_name=bucket_name,
@@ -146,7 +138,6 @@ oci_client = OCIClient()
 # ユーティリティ
 # =========================================
 def allowed_file(filename: str) -> bool:
-    """許可されたファイル拡張子かチェック"""
     if not filename or '.' not in filename:
         return False
     extension = filename.rsplit('.', 1)[1].lower()
@@ -159,7 +150,6 @@ def _embed_image_with_cohere_v4(data_uris: list[str]) -> list[array.array]:
     引数: data_uris は 'data:<mime>;base64,<b64>' 形式の配列（1枚推奨）
     戻り値: array('f')（float32）を要素にもつリスト（1枚なら長さ1）
     """
-    # OCI SDK クライアント初期化
     config = oci.config.from_file(
         os.path.expanduser(settings.OCI_CONFIG_FILE),
         profile_name=settings.OCI_PROFILE
@@ -179,8 +169,8 @@ def _embed_image_with_cohere_v4(data_uris: list[str]) -> list[array.array]:
     details.serving_mode = oci.generative_ai_inference.models.OnDemandServingMode(
         model_id=os.environ.get("OCI_COHERE_EMBED_MODEL", "cohere.embed-v4.0")
     )
-    details.input_type = "IMAGE"           # 画像モード
-    details.inputs = data_uris             # data URI の配列（推奨1枚ずつ）
+    details.input_type = "IMAGE"
+    details.inputs = data_uris
     details.truncate = "NONE"
     details.compartment_id = os.environ["OCI_COMPARTMENT_OCID"]
 
@@ -223,7 +213,6 @@ def _save_embedding_to_db(bucket: str, object_name: str, content_type: str,
 # Flask アプリケーション
 # =========================================
 def create_app(config_name: str = None) -> Flask:
-    """アプリケーションファクトリ"""
     app = Flask(__name__)
 
     # 設定の読み込み
@@ -270,33 +259,33 @@ def create_app(config_name: str = None) -> Flask:
         default_limits=[settings.RATELIMIT_DEFAULT]
     )
 
-    # セキュリティヘッダー設定（csp 警告は無視の方針）
+    # セキュリティヘッダー設定（Talismanはcsp引数なしで初期化）
     try:
-        Talisman(app,
-                 force_https=settings.FORCE_HTTPS,
-                 csp=settings.CONTENT_SECURITY_POLICY)
-        logger.info("Talisman セキュリティヘッダー設定完了")
+        Talisman(app, force_https=settings.FORCE_HTTPS)
+        logger.info("Talisman セキュリティヘッダー設定完了（cspは自前で設定）")
     except Exception as e:
         logger.warning("Talisman 設定に失敗、基本的なセキュリティヘッダーを手動設定", error=str(e))
 
-        @app.after_request
-        def add_security_headers(response):
-            response.headers['X-Content-Type-Options'] = 'nosniff'
-            response.headers['X-Frame-Options'] = 'DENY'
-            response.headers['X-XSS-Protection'] = '1; mode=block'
-            if settings.FORCE_HTTPS:
-                response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-            return response
-        
-        # テストページだけ CSP を緩める（開発用）
-        def relax_csp_for_test(response):
-            if request.path in ("/test", "/test.html"):
-                response.headers["Content-Security-Policy"] = (
-                    "default-src 'self'; "
-                    "img-src 'self' data:; "          # サムネ/プレビュー用の data: を許可
-                    "script-src 'self' 'unsafe-inline'; "
-                    "style-src 'self' 'unsafe-inline'"
-                )
+    # === ここからは自前のヘッダー付与（常時）===
+    @app.after_request
+    def add_security_headers(response):
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        response.headers['X-XSS-Protection'] = '1; mode=block'
+        if settings.FORCE_HTTPS:
+            response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+        return response
+
+    # === /test, /test.html の時だけ CSP を緩める（開発用）===
+    @app.after_request
+    def relax_csp_for_test(response):
+        if request.path in ("/test", "/test.html"):
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; "
+                "img-src 'self' data:; "
+                "script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'"
+            )
         return response
 
     # -----------------------------------------
@@ -304,7 +293,6 @@ def create_app(config_name: str = None) -> Flask:
     # -----------------------------------------
     @app.route('/')
     def index():
-        """ヘルスチェック用エンドポイント"""
         is_connected = oci_client.is_connected()
         return jsonify({
             'status': 'running',
@@ -320,20 +308,15 @@ def create_app(config_name: str = None) -> Flask:
 
     @app.route('/test')
     def test_page():
-        """テストページを提供"""
         return send_from_directory('.', 'test.html')
 
     @app.route('/test.html')
     def test_upload_page():
-        """テストアップロードページを提供"""
         return send_from_directory('.', 'test.html')
 
     @app.route('/img/<bucket>/<path:obj>')
     @limiter.limit("50 per minute")
     def serve_image(bucket, obj):
-        """
-        OCI Object Storageから画像を取得して返すプロキシエンドポイント
-        """
         try:
             if not oci_client.is_connected():
                 logger.error("画像取得失敗 - OCI接続エラー")
@@ -350,8 +333,8 @@ def create_app(config_name: str = None) -> Flask:
                 response.data.content,
                 mimetype=content_type,
                 headers={
-                    'Cache-Control': 'max-age=3600',  # 1時間キャッシュ
-                    'Content-Disposition': f'inline; filename="{obj.split("/")[-1]}"'  # noqa
+                    'Cache-Control': 'max-age=3600',
+                    'Content-Disposition': f'inline; filename="{obj.split("/")[-1]}"'
                 }
             )
 
@@ -418,7 +401,6 @@ def create_app(config_name: str = None) -> Flask:
                     embedding = embeddings[0]  # array('f') 1536次元を想定
                     logger.info("画像embedding生成成功", dims=len(embedding))
             except Exception as e:
-                # Embedding失敗でもストレージ保存は継続するポリシー
                 logger.error("画像embedding生成失敗", error=str(e))
 
             # === (B) Object Storage にPUT ===
@@ -463,75 +445,7 @@ def create_app(config_name: str = None) -> Flask:
 
     @app.route('/health')
     def health_check():
-        """ヘルスチェック用エンドポイント"""
         is_connected = oci_client.is_connected()
         return jsonify({
             'status': 'healthy' if is_connected else 'unhealthy',
-            'oci_connection': 'OK' if is_connected else 'OCI接続が初期化されていません',
-            'timestamp': datetime.now().isoformat()
-        }), 200 if is_connected else 503
-
-    # エラーハンドラー
-    @app.errorhandler(413)
-    def too_large(e):
-        """ファイルサイズ制限エラーハンドラ"""
-        logger.warning("ファイルサイズ制限エラー")
-        return jsonify({'error': 'ファイルサイズが大きすぎます'}), 413
-
-    @app.errorhandler(404)
-    def not_found(e):
-        """404エラーハンドラ"""
-        return jsonify({'error': 'エンドポイントが見つかりません'}), 404
-
-    @app.errorhandler(500)
-    def internal_error(e):
-        """500エラーハンドラ"""
-        logger.error("内部サーバーエラー", error=str(e))
-        return jsonify({'error': '内部サーバーエラーが発生しました'}), 500
-
-    @app.errorhandler(ServiceError)
-    def handle_oci_error(e):
-        """OCI サービスエラーハンドラ"""
-        logger.error("OCI サービスエラー",
-                    status=e.status,
-                    code=e.code,
-                    message=e.message)
-        return jsonify({
-            'error': 'OCI サービスエラーが発生しました',
-            'details': e.message if settings.DEBUG else None
-        }), 500
-
-    return app
-
-
-def create_production_app() -> Flask:
-    """本番環境用アプリケーション作成"""
-    return create_app('production')
-
-
-def create_development_app() -> Flask:
-    """開発環境用アプリケーション作成"""
-    return create_app('development')
-
-
-def create_testing_app() -> Flask:
-    """テスト環境用アプリケーション作成"""
-    return create_app('testing')
-
-
-# デフォルトアプリケーション（開発用）
-app = create_development_app()
-
-
-if __name__ == '__main__':
-    # 開発環境での実行
-    env = os.getenv('FLASK_ENV', 'development')
-    port = int(os.getenv('PORT', settings.PORT))
-    debug = settings.DEBUG
-
-    logger.info("アプリケーション開始",
-                environment=env,
-                port=port,
-                debug=debug)
-
-    app.run(host=settings.HOST, port=port, debug=debug)
+            'oci_connection': 'OK'_
