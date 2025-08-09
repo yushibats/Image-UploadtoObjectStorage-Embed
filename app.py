@@ -91,6 +91,7 @@ class OCIClient:
                 profile_name=settings.OCI_PROFILE
             )
 
+            # リージョンの設定（指定があれば上書き）
             if settings.OCI_REGION:
                 config['region'] = settings.OCI_REGION
 
@@ -448,4 +449,63 @@ def create_app(config_name: str = None) -> Flask:
         is_connected = oci_client.is_connected()
         return jsonify({
             'status': 'healthy' if is_connected else 'unhealthy',
-            'oci_connection': 'OK'_
+            'oci_connection': 'OK' if is_connected else 'OCI接続が初期化されていません',
+            'timestamp': datetime.now().isoformat()
+        }), 200 if is_connected else 503
+
+    # エラーハンドラー
+    @app.errorhandler(413)
+    def too_large(e):
+        logger.warning("ファイルサイズ制限エラー")
+        return jsonify({'error': 'ファイルサイズが大きすぎます'}), 413
+
+    @app.errorhandler(404)
+    def not_found(e):
+        return jsonify({'error': 'エンドポイントが見つかりません'}), 404
+
+    @app.errorhandler(500)
+    def internal_error(e):
+        logger.error("内部サーバーエラー", error=str(e))
+        return jsonify({'error': '内部サーバーエラーが発生しました'}), 500
+
+    @app.errorhandler(ServiceError)
+    def handle_oci_error(e):
+        logger.error("OCI サービスエラー",
+                    status=e.status,
+                    code=e.code,
+                    message=e.message)
+        return jsonify({
+            'error': 'OCI サービスエラーが発生しました',
+            'details': e.message if settings.DEBUG else None
+        }), 500
+
+    return app
+
+
+def create_production_app() -> Flask:
+    return create_app('production')
+
+
+def create_development_app() -> Flask:
+    return create_app('development')
+
+
+def create_testing_app() -> Flask:
+    return create_app('testing')
+
+
+# デフォルトアプリケーション（開発用）
+app = create_development_app()
+
+
+if __name__ == '__main__':
+    env = os.getenv('FLASK_ENV', 'development')
+    port = int(os.getenv('PORT', settings.PORT))
+    debug = settings.DEBUG
+
+    logger.info("アプリケーション開始",
+                environment=env,
+                port=port,
+                debug=debug)
+
+    app.run(host=settings.HOST, port=port, debug=debug)
