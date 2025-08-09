@@ -42,6 +42,9 @@ from sentry_sdk.integrations.flask import FlaskIntegration
 
 from config import settings, get_config
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # 構造化ログの設定
 structlog.configure(
     processors=[
