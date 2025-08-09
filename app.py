@@ -287,6 +287,17 @@ def create_app(config_name: str = None) -> Flask:
             if settings.FORCE_HTTPS:
                 response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
             return response
+        
+        # テストページだけ CSP を緩める（開発用）
+        def relax_csp_for_test(response):
+            if request.path in ("/test", "/test.html"):
+                response.headers["Content-Security-Policy"] = (
+                    "default-src 'self'; "
+                    "img-src 'self' data:; "          # サムネ/プレビュー用の data: を許可
+                    "script-src 'self' 'unsafe-inline'; "
+                    "style-src 'self' 'unsafe-inline'"
+                )
+        return response
 
     # -----------------------------------------
     # ルーティング
