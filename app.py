@@ -4,35 +4,39 @@
 Oracle Cloud Storage 画像プロキシアプリケーション
 OCIオブジェクトストレージの画像を認証付きで表示・アップロードするFlaskアプリ
 
-業界ベストプラクティスに基づく実装:
-- 型安全な設定管理 (Pydantic)
-- 構造化ログ (structlog)
-- セキュリティヘッダー (Flask-Talisman)
-- レート制限 (Flask-Limiter)
-- CORS対応 (Flask-CORS)
-- エラー監視 (Sentry)
+追加: /upload でアップロード後に OCI Generative AI (Cohere Embed v4) で
+画像をベクトル化し、Oracle Database（23c VECTOR型を想定）に保存します。
+
+必要な環境変数:
+- DB_USER, DB_PASSWORD, DB_DSN
+- OCI_COMPARTMENT_OCID
+- OCI_COHERE_EMBED_MODEL (例: cohere.embed-v4.0)
+
+必要パッケージ:
+- oci
+- oracledb
 """
 
 import os
 import uuid
+import base64
+import array
 import structlog
-from datetime import datetime, timedelta
-from typing import Optional, Tuple, Dict, Any
+from io import BytesIO
+from datetime import datetime
+from typing import Optional
 from pathlib import Path
 
-from flask import Flask, Response, request, jsonify, abort, send_from_directory
+from flask import Flask, Response, request, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
-from werkzeug.utils import secure_filename
-from werkzeug.exceptions import RequestEntityTooLarge
 
+import oracledb
 import oci
 from oci.object_storage import ObjectStorageClient
-from oci.object_storage.models import CreatePreauthenticatedRequestDetails
 from oci.exceptions import ServiceError
-
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 
@@ -60,6 +64,9 @@ structlog.configure(
 logger = structlog.get_logger(__name__)
 
 
+# =========================================
+# OCI Object Storage クライアント
+# =========================================
 class OCIClient:
     """OCI Object Storage クライアントラッパー"""
 
@@ -82,7 +89,7 @@ class OCIClient:
                 profile_name=settings.OCI_PROFILE
             )
 
-            # リージョンの設定
+            # リージョンの設定（指定があれば上書き）
             if settings.OCI_REGION:
                 config['region'] = settings.OCI_REGION
 
@@ -90,8 +97,8 @@ class OCIClient:
             self.namespace = self.client.get_namespace().data
 
             logger.info("OCI接続成功",
-                       namespace=self.namespace,
-                       region=config.get('region'))
+                        namespace=self.namespace,
+                        region=config.get('region'))
 
         except Exception as e:
             logger.error("OCI設定の初期化に失敗", error=str(e))
@@ -131,15 +138,85 @@ class OCIClient:
 oci_client = OCIClient()
 
 
+# =========================================
+# ユーティリティ
+# =========================================
 def allowed_file(filename: str) -> bool:
     """許可されたファイル拡張子かチェック"""
     if not filename or '.' not in filename:
         return False
-
     extension = filename.rsplit('.', 1)[1].lower()
     return extension in settings.ALLOWED_EXTENSIONS
 
 
+def _embed_image_with_cohere_v4(base64_images: list[str]) -> list[array.array]:
+    """
+    OCI Generative AI (Cohere Embed v4)で画像のembeddingを生成。
+    戻り値: array('f')（float32）を要素にもつリスト（1枚なら長さ1）
+    """
+    # OCI SDK クライアント初期化
+    config = oci.config.from_file(
+        os.path.expanduser(settings.OCI_CONFIG_FILE),
+        profile_name=settings.OCI_PROFILE
+    )
+    region = settings.OCI_REGION or config.get("region")
+    if not region:
+        raise RuntimeError("OCIリージョンが解決できません。settings.OCI_REGION または設定ファイルを確認してください。")
+
+    gai = oci.generative_ai_inference.GenerativeAiInferenceClient(
+        config=config,
+        service_endpoint=f"https://inference.generativeai.{region}.oci.oraclecloud.com",
+        retry_strategy=oci.retry.NoneRetryStrategy(),
+        timeout=(10, 240),
+    )
+
+    details = oci.generative_ai_inference.models.EmbedTextDetails()
+    details.serving_mode = oci.generative_ai_inference.models.OnDemandServingMode(
+        model_id=os.environ.get("OCI_COHERE_EMBED_MODEL", "cohere.embed-v4.0")
+    )
+    details.input_type = "IMAGE"           # 画像モード
+    details.inputs = base64_images         # base64文字列の配列（推奨1枚ずつ）
+    details.truncate = "NONE"
+    details.compartment_id = os.environ["OCI_COMPARTMENT_OCID"]
+
+    resp = gai.embed_text(details)
+    out: list[array.array] = []
+    for emb in resp.data.embeddings:
+        out.append(array.array("f", emb))  # float32へ変換
+    return out
+
+
+def _save_embedding_to_db(bucket: str, object_name: str, content_type: str,
+                          file_size: int, embedding: array.array):
+    """
+    python-oracledb Thin で VECTOR 型にINSERT
+    期待テーブル: img_embeddings(bucket, object_name, content_type, file_size, uploaded_at, embedding)
+    embedding は VECTOR(1536, FLOAT32) を想定
+    """
+    conn = oracledb.connect(
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        dsn=os.environ["DB_DSN"],
+    )
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO img_embeddings
+              (bucket, object_name, content_type, file_size, uploaded_at, embedding)
+            VALUES
+              (:1, :2, :3, :4, SYSTIMESTAMP, :5)
+            """,
+            [bucket, object_name, content_type, file_size, embedding],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# =========================================
+# Flask アプリケーション
+# =========================================
 def create_app(config_name: str = None) -> Flask:
     """アプリケーションファクトリ"""
     app = Flask(__name__)
@@ -206,6 +283,9 @@ def create_app(config_name: str = None) -> Flask:
                 response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
             return response
 
+    # -----------------------------------------
+    # ルーティング
+    # -----------------------------------------
     @app.route('/')
     def index():
         """ヘルスチェック用エンドポイント"""
@@ -237,26 +317,15 @@ def create_app(config_name: str = None) -> Flask:
     def serve_image(bucket, obj):
         """
         OCI Object Storageから画像を取得して返すプロキシエンドポイント
-
-        Args:
-            bucket: バケット名
-            obj: オブジェクト名（パス含む）
-
-        Returns:
-            画像データまたはエラーレスポンス
         """
         try:
-            # OCI接続チェック
             if not oci_client.is_connected():
                 logger.error("画像取得失敗 - OCI接続エラー")
                 return jsonify({'error': 'OCI接続エラー'}), 500
 
             logger.info("画像取得開始", bucket=bucket, object=obj)
 
-            # オブジェクトを取得
             response = oci_client.get_object(bucket, obj)
-
-            # Content-Typeを取得（デフォルトは画像として扱う）
             content_type = response.headers.get('Content-Type', 'image/jpeg')
 
             logger.info("画像取得成功", object=obj, content_type=content_type)
@@ -285,23 +354,13 @@ def create_app(config_name: str = None) -> Flask:
     @limiter.limit(settings.RATELIMIT_UPLOAD)
     def upload_image():
         """
-        画像をOCI Object Storageにアップロードするエンドポイント
-
-        Request:
-            - file: アップロードする画像ファイル
-            - bucket (optional): アップロード先バケット名
-            - folder (optional): アップロード先フォルダ
-
-        Returns:
-            アップロード結果とアクセス用URL
+        画像をOCI Object Storageにアップロードし、同時にEmbeddingをDBへ保存
         """
         try:
-            # OCI接続チェック
             if not oci_client.is_connected():
                 logger.error("アップロード失敗 - OCI接続エラー")
                 return jsonify({'error': 'OCI接続エラー'}), 500
 
-            # ファイルの存在チェック
             if 'file' not in request.files:
                 return jsonify({'error': 'ファイルが選択されていません'}), 400
 
@@ -309,51 +368,55 @@ def create_app(config_name: str = None) -> Flask:
             if file.filename == '':
                 return jsonify({'error': 'ファイル名が空です'}), 400
 
-            # ファイル拡張子チェック
             if not allowed_file(file.filename):
                 return jsonify({
                     'error': f'許可されていないファイル形式です。許可形式: {", ".join(settings.ALLOWED_EXTENSIONS)}'
                 }), 400
 
-            # ファイルサイズチェック
-            file.seek(0, 2)  # ファイル末尾に移動
-            file_size = file.tell()
-            file.seek(0)  # ファイル先頭に戻る
-
+            # === ファイルを一度メモリに読み込む（Embed/PUTの双方で使う）===
+            raw = file.read()
+            file_size = len(raw)
             if file_size > settings.MAX_CONTENT_LENGTH:
-                max_size_mb = settings.MAX_CONTENT_LENGTH // (1024*1024)
-                return jsonify({
-                    'error': f'ファイルサイズが大きすぎます。最大サイズ: {max_size_mb}MB'
-                }), 400
+                max_size_mb = settings.MAX_CONTENT_LENGTH // (1024 * 1024)
+                return jsonify({'error': f'ファイルサイズが大きすぎます。最大サイズ: {max_size_mb}MB'}), 400
 
-            # アップロード先設定
+            # === 保存先/メタ ===
             bucket = request.form.get('bucket', settings.OCI_BUCKET)
             folder = request.form.get('folder', '')
+            ext = file.filename.rsplit('.', 1)[1].lower()
+            unique_filename = f"{uuid.uuid4().hex}.{ext}"
+            object_name = f"{folder.strip('/')}/{unique_filename}" if folder else unique_filename
+            content_type = file.content_type or 'application/octet-stream'
 
-            # ユニークなオブジェクト名を生成
-            file_extension = file.filename.rsplit('.', 1)[1].lower()
-            unique_filename = f"{uuid.uuid4().hex}.{file_extension}"
+            logger.info("アップロード開始", bucket=bucket, object=object_name, size=file_size)
 
-            # フォルダが指定されている場合はパスに含める
-            if folder:
-                object_name = f"{folder.strip('/')}/{unique_filename}"
-            else:
-                object_name = unique_filename
+            # === (A) 画像 → base64 → Embedding ===
+            embedding = None
+            try:
+                b64img = base64.b64encode(raw).decode('ascii')
+                embeddings = _embed_image_with_cohere_v4([b64img])  # 1件/呼び出し
+                if embeddings:
+                    embedding = embeddings[0]  # array('f') 1536次元を想定
+                    logger.info("画像embedding生成成功", dims=len(embedding))
+            except Exception as e:
+                # Embedding失敗でもストレージ保存は継続するポリシー
+                logger.error("画像embedding生成失敗", error=str(e))
 
-            logger.info("アップロード開始",
-                       bucket=bucket,
-                       object=object_name,
-                       size=file_size)
-
-            # OCI Object Storageにアップロード
+            # === (B) Object Storage にPUT ===
             oci_client.put_object(
                 bucket_name=bucket,
                 object_name=object_name,
-                data=file.stream,
-                content_type=file.content_type or 'application/octet-stream'
+                data=BytesIO(raw),
+                content_type=content_type
             )
 
-            # プロキシURL生成
+            # === (C) DB に保存（embeddingがある場合のみ） ===
+            if embedding is not None:
+                try:
+                    _save_embedding_to_db(bucket, object_name, content_type, file_size, embedding)
+                except Exception as e:
+                    logger.error("DB保存失敗（embedding）", error=str(e))
+
             proxy_url = f"/img/{bucket}/{object_name}"
 
             logger.info("アップロード成功", object=object_name)
@@ -366,8 +429,9 @@ def create_app(config_name: str = None) -> Flask:
                     'bucket': bucket,
                     'proxy_url': proxy_url,
                     'file_size': file_size,
-                    'content_type': file.content_type,
-                    'uploaded_at': datetime.now().isoformat()
+                    'content_type': content_type,
+                    'uploaded_at': datetime.now().isoformat(),
+                    'embedding_saved': embedding is not None
                 }
             })
 
@@ -447,8 +511,8 @@ if __name__ == '__main__':
     debug = settings.DEBUG
 
     logger.info("アプリケーション開始",
-               environment=env,
-               port=port,
-               debug=debug)
+                environment=env,
+                port=port,
+                debug=debug)
 
     app.run(host=settings.HOST, port=port, debug=debug)
