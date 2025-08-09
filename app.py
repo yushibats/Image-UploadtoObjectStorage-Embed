@@ -340,7 +340,7 @@ def create_app(config_name: str = None) -> Flask:
                 mimetype=content_type,
                 headers={
                     'Cache-Control': 'max-age=3600',  # 1時間キャッシュ
-                    'Content-Disposition': f'inline; filename="{obj.split('/')[-1]}'"  # noqa
+                    'Content-Disposition': f'inline; filename="{obj.split("/")[-1]}"'  # noqa
                 }
             )
 
