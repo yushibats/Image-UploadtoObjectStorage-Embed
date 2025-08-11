@@ -192,14 +192,23 @@ def _save_embedding_to_db(bucket: str, object_name: str, content_type: str,
     )
     try:
         cur = conn.cursor()
+        # VECTOR型として挿入するため、入力サイズとPython側の形式を明示的に指定
+        cur.setinputsizes(embedding=oracledb.DB_TYPE_VECTOR)
+        emb_list = embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
         cur.execute(
             """
             INSERT INTO img_embeddings
               (bucket, object_name, content_type, file_size, uploaded_at, embedding)
             VALUES
-              (:1, :2, :3, :4, SYSTIMESTAMP, :5)
+              (:bucket, :object_name, :content_type, :file_size, SYSTIMESTAMP, :embedding)
             """,
-            [bucket, object_name, content_type, file_size, embedding],
+            {
+                "bucket": bucket,
+                "object_name": object_name,
+                "content_type": content_type,
+                "file_size": file_size,
+                "embedding": emb_list,
+            },
         )
         conn.commit()
     finally:

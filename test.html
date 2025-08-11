@@ -231,14 +231,15 @@
                 const data = await response.json();
                 
                 if (response.ok && data.success) {
-                    showResult(`
-                        <strong>✅ アップロード成功!</strong><br>
+                    showResult(
+                        `<strong>✅ アップロード成功!</strong><br>
                         <strong>オブジェクト名:</strong> ${data.data.object_name}<br>
                         <strong>バケット:</strong> ${data.data.bucket}<br>
                         <strong>プロキシURL:</strong> <a href="${data.data.proxy_url}" target="_blank">${data.data.proxy_url}</a><br>
                         <strong>ファイルサイズ:</strong> ${formatFileSize(data.data.file_size)}<br>
-                        <img src="${data.data.proxy_url}" style="max-width: 200px; margin-top: 10px; border-radius: 5px;">
-                    `, 'success');
+                        <img src="${data.data.proxy_url}" style="max-width: 200px; margin-top: 10px; border-radius: 5px;">`,
+                        'success'
+                    );
                 } else {
                     showResult(`❌ アップロード失敗: ${data.error || 'Unknown error'}`, 'error');
                 }
