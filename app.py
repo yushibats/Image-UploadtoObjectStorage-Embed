@@ -637,7 +637,7 @@ app = create_development_app()
 
 if __name__ == '__main__':
     env = os.getenv('FLASK_ENV', 'development')
-    port = int(os.getenv('PORT', settings.PORT))
-    debug = settings.DEBUG
+    port = app.config.get('PORT', 5000)
+    debug = app.config.get('DEBUG', False)
     logger.info("アプリケーション開始", environment=env, port=port, debug=debug)
-    app.run(host=settings.HOST, port=port, debug=debug)
+    app.run(host=app.config.get('HOST', '0.0.0.0'), port=port, debug=debug)
