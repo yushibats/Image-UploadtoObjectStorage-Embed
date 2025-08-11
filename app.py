@@ -28,7 +28,6 @@ import array
 import structlog
 import mimetypes
 import secrets
-from io import BytesIO
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
@@ -529,6 +528,7 @@ label {{ display:block; font-weight:600; margin-bottom:6px; }}
             if file_size > settings.MAX_CONTENT_LENGTH:
                 max_size_mb = settings.MAX_CONTENT_LENGTH // (1024 * 1024)
                 return jsonify({'error': f'ファイルサイズが大きすぎます。最大サイズ: {max_size_mb}MB'}), 400
+            file.stream.seek(0)
 
             # 保存先/メタ
             bucket = request.form.get('bucket', settings.OCI_BUCKET)
@@ -556,7 +556,7 @@ label {{ display:block; font-weight:600; margin-bottom:6px; }}
             oci_client.put_object(
                 bucket_name=bucket,
                 object_name=object_name,
-                data=BytesIO(raw),
+                data=file.stream,
                 content_type=content_type
             )
 
