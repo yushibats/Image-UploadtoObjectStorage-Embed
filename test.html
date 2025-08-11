@@ -94,6 +94,16 @@
             border-radius: 4px;
             box-sizing: border-box;
         }
+        .row {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        .small {
+            font-size: 12px;
+            color: #666;
+        }
     </style>
 </head>
 <body>
@@ -111,18 +121,13 @@
                 <input type="text" id="folder" name="folder" placeholder="例: avatars, uploads">
             </div>
             
-            <div class="upload-area" id="uploadArea">
-                <p>📁 ここに画像ファイルをドラッグ＆ドロップするか、下のボタンでファイルを選択してください</p>
-                <input type="file" id="fileInput" accept="image/*" style="display: none;">
-                <button type="button" onclick="document.getElementById('fileInput').click()">
-                    ファイルを選択
-                </button>
-            </div>
-            
-            <div id="fileInfo" style="display: none;">
-                <p><strong>選択されたファイル:</strong> <span id="fileName"></span></p>
-                <p><strong>ファイルサイズ:</strong> <span id="fileSize"></span></p>
-                <img id="preview" class="preview" style="display: none;">
+            <div id="dropzone" class="row">
+                📁 ここに画像ファイルをドラッグ＆ドロップするか、下のボタンでファイルを選択してください
+                <div style="margin-top:8px">
+                  <input id="file" type="file" accept="image/*">
+                </div>
+                <div id="picked" class="small" style="margin-top:8px"></div>
+                <img id="preview" class="preview" style="display:none">
             </div>
             
             <button type="submit" id="uploadBtn" disabled>アップロード開始</button>
@@ -132,29 +137,27 @@
     </div>
 
     <script>
-        const uploadArea = document.getElementById('uploadArea');
-        const fileInput = document.getElementById('fileInput');
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('file');
         const uploadForm = document.getElementById('uploadForm');
         const uploadBtn = document.getElementById('uploadBtn');
         const result = document.getElementById('result');
-        const fileInfo = document.getElementById('fileInfo');
-        const fileName = document.getElementById('fileName');
-        const fileSize = document.getElementById('fileSize');
+        const picked = document.getElementById('picked');
         const preview = document.getElementById('preview');
 
         // ドラッグ＆ドロップ処理
-        uploadArea.addEventListener('dragover', (e) => {
+        dropzone.addEventListener('dragover', (e) => {
             e.preventDefault();
-            uploadArea.classList.add('dragover');
+            dropzone.classList.add('dragover');
         });
 
-        uploadArea.addEventListener('dragleave', () => {
-            uploadArea.classList.remove('dragover');
+        dropzone.addEventListener('dragleave', () => {
+            dropzone.classList.remove('dragover');
         });
 
-        uploadArea.addEventListener('drop', (e) => {
+        dropzone.addEventListener('drop', (e) => {
             e.preventDefault();
-            uploadArea.classList.remove('dragover');
+            dropzone.classList.remove('dragover');
             const files = e.dataTransfer.files;
             if (files.length > 0) {
                 handleFileSelect(files[0]);
@@ -169,8 +172,7 @@
         });
 
         function handleFileSelect(file) {
-            fileName.textContent = file.name;
-            fileSize.textContent = formatFileSize(file.size);
+            picked.textContent = `選択されたファイル: ${file.name} (${formatFileSize(file.size)})`;
             
             // プレビュー表示
             if (file.type.startsWith('image/')) {
@@ -180,9 +182,10 @@
                     preview.style.display = 'block';
                 };
                 reader.readAsDataURL(file);
+            } else {
+                preview.style.display = 'none';
             }
             
-            fileInfo.style.display = 'block';
             uploadBtn.disabled = false;
             
             // ファイル入力に設定
