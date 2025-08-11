@@ -4,17 +4,21 @@
 Oracle Cloud Storage 画像プロキシアプリケーション
 OCIオブジェクトストレージの画像を認証付きで表示・アップロードするFlaskアプリ
 
-追加: /upload でアップロード後に OCI Generative AI (Cohere Embed v4) で
-画像をベクトル化し、Oracle Database（23c VECTOR型を想定）に保存します。
+機能:
+- /upload: 画像をOCI Object Storageへ保存し、同時に OCI Generative AI (Cohere Embed v4) で
+  画像をベクトル化 → Oracle Database(23c VECTOR想定)に保存
+- /img/<bucket>/<obj>: オブジェクトストレージの画像をプロキシ配信
+- /test: CSP nonce方式で動く自己完結UI（外部CDN不使用）
+- /health, /: ヘルスチェック
 
-必要な環境変数:
+環境変数(必須):
 - DB_USER, DB_PASSWORD, DB_DSN
 - OCI_COMPARTMENT_OCID
 - OCI_COHERE_EMBED_MODEL (例: cohere.embed-v4.0)
 
-必要パッケージ:
-- oci
-- oracledb
+依存:
+- flask, flask-cors, flask-limiter, flask-talisman, structlog
+- oci, oracledb, python-dotenv, sentry-sdk
 """
 
 import os
@@ -23,12 +27,13 @@ import base64
 import array
 import structlog
 import mimetypes
+import secrets
 from io import BytesIO
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
 
-from flask import Flask, Response, request, jsonify, send_from_directory
+from flask import Flask, Response, request, jsonify, send_from_directory, g, make_response
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -38,15 +43,17 @@ import oracledb
 import oci
 from oci.object_storage import ObjectStorageClient
 from oci.exceptions import ServiceError
+
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
-
-from config import settings, get_config
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# 構造化ログの設定
+# 設定モジュール（あなたの既存のconfig.pyを使用）
+from config import settings, get_config
+
+# 構造化ログ
 structlog.configure(
     processors=[
         structlog.stdlib.filter_by_level,
@@ -71,36 +78,28 @@ logger = structlog.get_logger(__name__)
 # OCI Object Storage クライアント
 # =========================================
 class OCIClient:
-    """OCI Object Storage クライアントラッパー"""
-
     def __init__(self):
         self.client: Optional[ObjectStorageClient] = None
         self.namespace: Optional[str] = None
         self._initialize()
 
     def _initialize(self):
-        """OCI クライアントの初期化"""
         try:
-            config_file = os.path.expanduser(settings.OCI_CONFIG_FILE)
-            if not os.path.exists(config_file):
-                logger.warning("OCI設定ファイルが見つかりません", config_file=config_file)
+            cfg_file = os.path.expanduser(settings.OCI_CONFIG_FILE)
+            if not os.path.exists(cfg_file):
+                logger.warning("OCI設定ファイルが見つかりません", config_file=cfg_file)
                 return
 
             config = oci.config.from_file(
-                file_location=config_file,
+                file_location=cfg_file,
                 profile_name=settings.OCI_PROFILE
             )
-
-            # リージョンの設定（指定があれば上書き）
             if settings.OCI_REGION:
                 config['region'] = settings.OCI_REGION
 
             self.client = ObjectStorageClient(config)
             self.namespace = self.client.get_namespace().data
-
-            logger.info("OCI接続成功",
-                        namespace=self.namespace,
-                        region=config.get('region'))
+            logger.info("OCI接続成功", namespace=self.namespace, region=config.get('region'))
 
         except Exception as e:
             logger.error("OCI設定の初期化に失敗", error=str(e))
@@ -131,7 +130,6 @@ class OCIClient:
         )
 
 
-# グローバル OCI クライアント
 oci_client = OCIClient()
 
 
@@ -147,9 +145,8 @@ def allowed_file(filename: str) -> bool:
 
 def _embed_image_with_cohere_v4(data_uris: list[str]) -> list[array.array]:
     """
-    OCI Generative AI (Cohere Embed v4)で画像のembeddingを生成。
-    引数: data_uris は 'data:<mime>;base64,<b64>' 形式の配列（1枚推奨）
-    戻り値: array('f')（float32）を要素にもつリスト（1枚なら長さ1）
+    Cohere Embed v4 で画像のembeddingを生成（data URIを渡す）
+    戻り: array('f') (float32) のリスト
     """
     config = oci.config.from_file(
         os.path.expanduser(settings.OCI_CONFIG_FILE),
@@ -178,16 +175,15 @@ def _embed_image_with_cohere_v4(data_uris: list[str]) -> list[array.array]:
     resp = gai.embed_text(details)
     out: list[array.array] = []
     for emb in resp.data.embeddings:
-        out.append(array.array("f", emb))  # float32へ変換
+        out.append(array.array("f", emb))
     return out
 
 
 def _save_embedding_to_db(bucket: str, object_name: str, content_type: str,
                           file_size: int, embedding: array.array):
     """
-    python-oracledb Thin で VECTOR 型にINSERT
+    python-oracledb Thinで VECTOR にINSERT
     期待テーブル: img_embeddings(bucket, object_name, content_type, file_size, uploaded_at, embedding)
-    embedding は VECTOR(1536, FLOAT32) を想定
     """
     conn = oracledb.connect(
         user=os.environ["DB_USER"],
@@ -211,17 +207,14 @@ def _save_embedding_to_db(bucket: str, object_name: str, content_type: str,
 
 
 # =========================================
-# Flask アプリケーション
+# Flask アプリ
 # =========================================
 def create_app(config_name: str = None) -> Flask:
     app = Flask(__name__)
 
-    # 設定の読み込み
+    # 設定
     if config_name:
-        config_class = get_config(config_name)
-        app.config.from_object(config_class)
-
-    # 基本設定
+        app.config.from_object(get_config(config_name))
     app.config.update(
         SECRET_KEY=settings.SECRET_KEY,
         MAX_CONTENT_LENGTH=settings.MAX_CONTENT_LENGTH,
@@ -231,7 +224,7 @@ def create_app(config_name: str = None) -> Flask:
         PERMANENT_SESSION_LIFETIME=settings.PERMANENT_SESSION_LIFETIME,
     )
 
-    # Sentry初期化（エラー監視）
+    # Sentry
     if settings.SENTRY_DSN and settings.SENTRY_DSN.strip():
         try:
             sentry_sdk.init(
@@ -244,15 +237,15 @@ def create_app(config_name: str = None) -> Flask:
         except Exception as e:
             logger.warning("Sentry初期化に失敗", error=str(e))
     else:
-        logger.info("Sentry DSNが設定されていません。エラー監視は無効です。")
+        logger.info("Sentry無効")
 
-    # CORS設定
+    # CORS
     CORS(app,
          origins=settings.CORS_ORIGINS,
          methods=settings.CORS_METHODS,
          allow_headers=['Content-Type', 'Authorization'])
 
-    # レート制限設定
+    # レート制限
     limiter = Limiter(
         app=app,
         key_func=get_remote_address,
@@ -260,14 +253,14 @@ def create_app(config_name: str = None) -> Flask:
         default_limits=[settings.RATELIMIT_DEFAULT]
     )
 
-    # セキュリティヘッダー設定（Talismanはcsp引数なしで初期化）
+    # Talisman（cspは使わない）
     try:
         Talisman(app, force_https=settings.FORCE_HTTPS)
-        logger.info("Talisman セキュリティヘッダー設定完了（cspは自前で設定）")
+        logger.info("Talisman初期化（cspは自前設定）")
     except Exception as e:
-        logger.warning("Talisman 設定に失敗、基本的なセキュリティヘッダーを手動設定", error=str(e))
+        logger.warning("Talisman初期化失敗", error=str(e))
 
-    # === ここからは自前のヘッダー付与（常時）===
+    # --- Security Headers (always) ---
     @app.after_request
     def add_security_headers(response):
         response.headers['X-Content-Type-Options'] = 'nosniff'
@@ -277,15 +270,26 @@ def create_app(config_name: str = None) -> Flask:
             response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
         return response
 
-    # === /test, /test.html の時だけ CSP を緩める（開発用）===
+    # --- Nonce発行（/test のときだけ） ---
+    @app.before_request
+    def set_nonce_for_test():
+        if request.path in ("/test",):
+            g.csp_nonce = secrets.token_urlsafe(16)
+
+    # --- CSP (テストページだけnonceを使う) ---
     @app.after_request
-    def relax_csp_for_test(response):
-        if request.path in ("/test", "/test.html"):
+    def set_csp(response):
+        # /test: nonce方式（外部CDN無し・自己完結）
+        if request.path == "/test":
+            nonce = getattr(g, "csp_nonce", "")
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; "
-                "img-src 'self' data:; "
-                "script-src 'self' 'unsafe-inline'; "
-                "style-src 'self' 'unsafe-inline'"
+                f"script-src 'self' 'nonce-{nonce}'; "
+                f"style-src 'self' 'nonce-{nonce}'; "
+                "img-src 'self' data: blob:; "
+                "font-src 'self' data:; "
+                "connect-src 'self'; "
+                "frame-ancestors 'self'"
             )
         return response
 
@@ -309,10 +313,152 @@ def create_app(config_name: str = None) -> Flask:
 
     @app.route('/test')
     def test_page():
-        return send_from_directory('.', 'test.html')
+        """自己完結UI（CDN不使用 / nonce付きインラインJS・CSS）"""
+        nonce = getattr(g, "csp_nonce", "")
+        html = f"""<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>画像アップロードテスト</title>
+<style nonce="{nonce}">
+body {{ font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans JP", "Apple Color Emoji", "Segoe UI Emoji"; margin: 24px; }}
+h1 {{ font-size: 28px; display: flex; align-items: center; gap: 8px; }}
+.container {{ max-width: 900px; }}
+.row {{ margin: 12px 0; }}
+input[type="text"] {{ width: 320px; padding: 6px; }}
+button {{ padding: 10px 18px; border-radius: 6px; border: 1px solid #ddd; background:#2d6cdf; color:#fff; cursor:pointer; }}
+button:disabled {{ background:#9eb7e5; cursor:not-allowed; }}
+#dropzone {{ border:2px dashed #ccc; padding:20px; border-radius:8px; color:#333; }}
+#result {{ margin-top:16px; padding:12px; border-radius:8px; background:#e7f7ea; display:none; }}
+#error {{ margin-top:16px; padding:12px; border-radius:8px; background:#fdecea; color:#b00020; display:none; }}
+.preview {{ margin-top:10px; max-width:300px; border:1px solid #ddd; border-radius:6px; }}
+label {{ display:block; font-weight:600; margin-bottom:6px; }}
+.small {{ color:#555; font-size: 12px; }}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🖼️ 画像アップロードテスト</h1>
+
+  <div class="row">
+    <label>バケット名:</label>
+    <input id="bucket" type="text" value="{settings.OCI_BUCKET}">
+  </div>
+  <div class="row">
+    <label>フォルダ (オプション):</label>
+    <input id="folder" type="text" placeholder="例: avatars, uploads">
+  </div>
+
+  <div id="dropzone" class="row">
+    📁 ここに画像ファイルをドラッグ＆ドロップするか、下のボタンでファイルを選択してください
+    <div style="margin-top:8px">
+      <input id="file" type="file" accept="image/*">
+    </div>
+    <div id="picked" class="small" style="margin-top:8px"></div>
+    <img id="preview" class="preview" style="display:none">
+  </div>
+
+  <div class="row">
+    <button id="uploadBtn" disabled>アップロード開始</button>
+  </div>
+
+  <div id="result"></div>
+  <div id="error"></div>
+</div>
+
+<script nonce="{nonce}">
+(() => {{
+  const fileInput = document.getElementById('file');
+  const dropzone = document.getElementById('dropzone');
+  const uploadBtn = document.getElementById('uploadBtn');
+  const picked = document.getElementById('picked');
+  const preview = document.getElementById('preview');
+  const bucket = document.getElementById('bucket');
+  const folder = document.getElementById('folder');
+  const result = document.getElementById('result');
+  const errorBox = document.getElementById('error');
+
+  let currentFile = null;
+
+  function resetMessages() {{
+    result.style.display = 'none';
+    result.innerText = '';
+    errorBox.style.display = 'none';
+    errorBox.innerText = '';
+  }}
+
+  function onPicked(file) {{
+    currentFile = file;
+    picked.innerText = file ? `選択されたファイル: ${{file.name}} ( ${{(file.size/1024).toFixed(1)}} KB )` : '';
+    uploadBtn.disabled = !file;
+    if (file) {{
+      const url = URL.createObjectURL(file);
+      preview.src = url;
+      preview.style.display = 'block';
+    }} else {{
+      preview.style.display = 'none';
+    }}
+  }}
+
+  fileInput.addEventListener('change', (e) => {{
+    resetMessages();
+    onPicked(e.target.files[0]);
+  }});
+
+  dropzone.addEventListener('dragover', (e) => {{
+    e.preventDefault();
+  }});
+  dropzone.addEventListener('drop', (e) => {{
+    e.preventDefault();
+    resetMessages();
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {{
+      onPicked(e.dataTransfer.files[0]);
+    }}
+  }});
+
+  uploadBtn.addEventListener('click', async () => {{
+    resetMessages();
+    if (!currentFile) return;
+
+    const form = new FormData();
+    form.append('file', currentFile);
+    if (bucket.value) form.append('bucket', bucket.value);
+    if (folder.value) form.append('folder', folder.value);
+
+    try {{
+      const res = await fetch('/upload', {{ method: 'POST', body: form }});
+      const data = await res.json();
+
+      if (!res.ok || data.error) {{
+        throw new Error(data.error || 'アップロードに失敗しました');
+      }}
+
+      result.style.display = 'block';
+      result.innerHTML = `
+        ✅ アップロード成功!<br>
+        オブジェクト名: <b>${{data.data.object_name}}</b><br>
+        バケット: <b>${{data.data.bucket}}</b><br>
+        プロキシURL: <a href="${{data.data.proxy_url}}" target="_blank">${{data.data.proxy_url}}</a><br>
+        ファイルサイズ: ${{data.data.file_size}} bytes<br>
+        embedding_saved: <b>${{data.data.embedding_saved}}</b>
+        <div><img src="${{data.data.proxy_url}}" class="preview" style="margin-top:10px"></div>
+      `;
+    }} catch (err) {{
+      errorBox.style.display = 'block';
+      errorBox.innerText = 'エラー: ' + err.message;
+    }}
+  }});
+}})();
+</script>
+</body>
+</html>"""
+        resp = make_response(html, 200)
+        resp.headers["Content-Type"] = "text/html; charset=utf-8"
+        return resp
 
     @app.route('/test.html')
-    def test_upload_page():
+    def legacy_test():
+        """既存のtest.htmlをそのまま配信（CSPはnonce対応なし・開発用）"""
         return send_from_directory('.', 'test.html')
 
     @app.route('/img/<bucket>/<path:obj>')
@@ -324,7 +470,6 @@ def create_app(config_name: str = None) -> Flask:
                 return jsonify({'error': 'OCI接続エラー'}), 500
 
             logger.info("画像取得開始", bucket=bucket, object=obj)
-
             response = oci_client.get_object(bucket, obj)
             content_type = response.headers.get('Content-Type', 'image/jpeg')
 
@@ -338,7 +483,6 @@ def create_app(config_name: str = None) -> Flask:
                     'Content-Disposition': f'inline; filename="{obj.split("/")[-1]}"'
                 }
             )
-
         except ServiceError as e:
             if e.status == 404:
                 logger.warning("画像が見つかりません", bucket=bucket, object=obj)
@@ -353,9 +497,6 @@ def create_app(config_name: str = None) -> Flask:
     @app.route('/upload', methods=['POST'])
     @limiter.limit(settings.RATELIMIT_UPLOAD)
     def upload_image():
-        """
-        画像をOCI Object Storageにアップロードし、同時にEmbeddingをDBへ保存
-        """
         try:
             if not oci_client.is_connected():
                 logger.error("アップロード失敗 - OCI接続エラー")
@@ -373,38 +514,36 @@ def create_app(config_name: str = None) -> Flask:
                     'error': f'許可されていないファイル形式です。許可形式: {", ".join(settings.ALLOWED_EXTENSIONS)}'
                 }), 400
 
-            # === ファイルを一度メモリに読み込む（Embed/PUTの双方で使う）===
+            # 読み込み
             raw = file.read()
             file_size = len(raw)
             if file_size > settings.MAX_CONTENT_LENGTH:
                 max_size_mb = settings.MAX_CONTENT_LENGTH // (1024 * 1024)
                 return jsonify({'error': f'ファイルサイズが大きすぎます。最大サイズ: {max_size_mb}MB'}), 400
 
-            # === 保存先/メタ ===
+            # 保存先/メタ
             bucket = request.form.get('bucket', settings.OCI_BUCKET)
             folder = request.form.get('folder', '')
             ext = file.filename.rsplit('.', 1)[1].lower()
             unique_filename = f"{uuid.uuid4().hex}.{ext}"
             object_name = f"{folder.strip('/')}/{unique_filename}" if folder else unique_filename
-
-            # content_type が空なら拡張子から推定（data URI 用）
             content_type = file.content_type or mimetypes.guess_type(file.filename)[0] or 'image/png'
 
             logger.info("アップロード開始", bucket=bucket, object=object_name, size=file_size)
 
-            # === (A) 画像 → data URI → Embedding ===
+            # Embedding
             embedding = None
             try:
                 b64img = base64.b64encode(raw).decode('ascii')
                 data_uri = f"data:{content_type};base64,{b64img}"
-                embeddings = _embed_image_with_cohere_v4([data_uri])  # 1件/呼び出し
+                embeddings = _embed_image_with_cohere_v4([data_uri])
                 if embeddings:
-                    embedding = embeddings[0]  # array('f') 1536次元を想定
+                    embedding = embeddings[0]
                     logger.info("画像embedding生成成功", dims=len(embedding))
             except Exception as e:
                 logger.error("画像embedding生成失敗", error=str(e))
 
-            # === (B) Object Storage にPUT ===
+            # Object Storage PUT
             oci_client.put_object(
                 bucket_name=bucket,
                 object_name=object_name,
@@ -412,7 +551,7 @@ def create_app(config_name: str = None) -> Flask:
                 content_type=content_type
             )
 
-            # === (C) DB に保存（embeddingがある場合のみ） ===
+            # DB保存（embeddingがある時のみ）
             if embedding is not None:
                 try:
                     _save_embedding_to_db(bucket, object_name, content_type, file_size, embedding)
@@ -420,7 +559,6 @@ def create_app(config_name: str = None) -> Flask:
                     logger.error("DB保存失敗（embedding）", error=str(e))
 
             proxy_url = f"/img/{bucket}/{object_name}"
-
             logger.info("アップロード成功", object=object_name)
 
             return jsonify({
@@ -453,7 +591,7 @@ def create_app(config_name: str = None) -> Flask:
             'timestamp': datetime.now().isoformat()
         }), 200 if is_connected else 503
 
-    # エラーハンドラー
+    # エラーハンドラ
     @app.errorhandler(413)
     def too_large(e):
         logger.warning("ファイルサイズ制限エラー")
@@ -494,18 +632,12 @@ def create_testing_app() -> Flask:
     return create_app('testing')
 
 
-# デフォルトアプリケーション（開発用）
+# デフォルト（開発）
 app = create_development_app()
-
 
 if __name__ == '__main__':
     env = os.getenv('FLASK_ENV', 'development')
     port = int(os.getenv('PORT', settings.PORT))
     debug = settings.DEBUG
-
-    logger.info("アプリケーション開始",
-                environment=env,
-                port=port,
-                debug=debug)
-
+    logger.info("アプリケーション開始", environment=env, port=port, debug=debug)
     app.run(host=settings.HOST, port=port, debug=debug)
