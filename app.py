@@ -394,7 +394,8 @@ def create_app(config_name: str = None) -> Flask:
             embedding = None
             try:
                 b64img = base64.b64encode(raw).decode('ascii')
-                embeddings = _embed_image_with_cohere_v4([b64img])  # 1件/呼び出し
+                image_data_uri = f"data:{content_type};base64,{b64img}"
+                embeddings = _embed_image_with_cohere_v4([image_data_uri])  # 1件/呼び出し
                 if embeddings:
                     embedding = embeddings[0]  # array('f') 1536次元を想定
                     logger.info("画像embedding生成成功", dims=len(embedding))
