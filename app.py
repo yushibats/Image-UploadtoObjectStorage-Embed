@@ -18,6 +18,7 @@ OCIオブジェクトストレージの画像を認証付きで表示・アッ�
 """
 
 import os
+from dotenv import load_dotenv
 import uuid
 import base64
 import array
@@ -40,6 +41,7 @@ from oci.exceptions import ServiceError
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 
+load_dotenv()
 from config import settings, get_config
 
 # 構造化ログの設定
