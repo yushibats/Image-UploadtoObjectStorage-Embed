@@ -413,7 +413,8 @@ def create_app(config_name: str = None) -> Flask:
                 data=BytesIO(raw),
                 content_type=content_type
             )
-            time.sleep(1)
+            time.sleep(2)
+            print("time.sleep(2)")
 
             # === (C) DB に保存（embeddingがある場合のみ） ===
             if embedding is not None:
