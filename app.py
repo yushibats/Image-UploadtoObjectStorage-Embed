@@ -23,6 +23,7 @@ import uuid
 import base64
 import array
 import structlog
+import time
 from io import BytesIO
 from datetime import datetime
 from typing import Optional
@@ -412,6 +413,7 @@ def create_app(config_name: str = None) -> Flask:
                 data=BytesIO(raw),
                 content_type=content_type
             )
+            time.sleep(1)
 
             # === (C) DB に保存（embeddingがある場合のみ） ===
             if embedding is not None:
